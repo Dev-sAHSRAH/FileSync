@@ -1,78 +1,79 @@
 import os
-import os.path
-
-import os.path
-
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+import logging
+import datetime
+import pytz
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from google.oauth2.credentials import Credentials
 from googleapiclient.http import MediaFileUpload
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+# Set up logging
+logging.basicConfig(filename='back.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
 
-def main():
-  creds = None
-  # The file token.json stores the user's access and refresh tokens, and is
-  # created automatically when the authorization flow completes for the first
-  # time.
-  if os.path.exists("token.json"):
-    creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-  # If there are no (valid) credentials available, let the user log in.
-  if not creds or not creds.valid:
-    if creds and creds.expired and creds.refresh_token:
-      creds.refresh(Request())
+# Authentication
+def authenticate():
+    token_file = 'token.json'
+    SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
     else:
-      flow = InstalledAppFlow.from_client_secrets_file(
-          "credentials.json", SCOPES
-      )
-      creds = flow.run_local_server(port=0)
-    # Save the credentials for the next run
-    with open("token.json", "w") as token:
-      token.write(creds.to_json())
+        raise Exception("Credentials not found.")
+    return build('drive', 'v3', credentials=creds)
 
-  service = build("driveactivity", "v2", credentials=creds)
+# File Upload Logic
+def upload_file(service, filename, path):
+    folder_id = "1BGtSt-NsLuvO8DnL9YoFWMGFx6aE1is0"
+    file_path = os.path.join(path, filename)
+    media = MediaFileUpload(file_path)
 
-  # Call the Drive Activity API
-  try:
-    service = build("drive", "v3", credentials=creds)
-
-    response = service.files().list(
-      q = "name='BackupFolder2024' and mimeType='application/vnd.google-apps.folder'",
-      spaces = 'drive'
-    ).execute()
+    logging.info(f"Checking if file '{filename}' exists and needs updating...")
+    query = f"name='{filename}' and parents='{folder_id}'"
+    response = service.files().list(q=query, spaces='drive', fields='nextPageToken, files(id, name, modifiedTime)').execute()
 
     if not response['files']:
-      file_metadata = {
-        "name":"BackUpFolder2024",
-        "mimeType":"application/vnd.google-apps.folder"
-      }
+        # File not found, upload as new
+        logging.info(f"File '{filename}' not found. Uploading new file...")
+        file_metadata = {'name': filename, 'parents': [folder_id]}
+        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        logging.info(f"New file '{filename}' created with ID {file.get('id')}")
 
-      file = service.files().create(body = file_metadata, fields="id").execute()
-
-      folder_id  = file.get('id')
     else:
-      folder_id = response['files'][0]['id']
+        file = response.get('files', [])[0]
+        print("file: ",file)
+        remote_modified_time = datetime.datetime.strptime(file['modifiedTime'], '%Y-%m-%dT%H:%M:%S.%fZ')
+        remote_modified_time =  remote_modified_time.astimezone(pytz.timezone('Asia/Kolkata'))
+        local_modified_time = datetime.datetime.fromtimestamp(os.path.getmtime(file_path))
+        local_modified_time = pytz.utc.localize(local_modified_time).astimezone(pytz.timezone('Asia/Kolkata'))
 
-    for file in os.listdir('backupfiles'):
-      file_metadata = {
-        "name": file,
-        "parents":[folder_id]
-      }
+        print("local:",local_modified_time,"remote:", remote_modified_time)
 
-      media = MediaFileUpload(f"backupfiles/{file}")
-      upload_file = service.files().create(body = file_metadata,
-                                           media_body = media,
-                                           fields = "id").execute()
-      
-      print("Backed up files:" + file)
-    
-  except HttpError as error:
-    print(f"An error occurred: {error}")
+        if local_modified_time > remote_modified_time:  # Local file is newer
+            logging.info(f"File '{filename}' has been modified. Updating...")
 
+            logging.info(f"Deleting older File '{filename}'...")
+            service.files().delete(fileId=file['id']).execute()
 
+            file_metadata = {'name': filename, 'parents': [folder_id]}
+            file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            logging.info(f"New file '{filename}' created with ID {file.get('id')}")
+            logging.info(f"File '{filename}' updated.")
+        else:
+            logging.info(f"File '{filename}' is up-to-date. No update needed.")
 
-if __name__ == "__main__":
-  main()
+# Main Execution
+def main():
+    path = "backupFiles/"  # Your local folder to backup
+    service = authenticate()
+
+    for item in os.listdir(path):
+        logging.info(f"Processing file '{item}'...")
+        try:
+            upload_file(service, item, path)
+        except Exception as e:
+            logging.error(f"Error occurred while uploading file '{item}': {str(e)}")
+    logging.info("Backup process completed.")
+
+if __name__ == '__main__':
+    main()
